@@ -48,6 +48,11 @@ def fetch():
 
 
 def fmt_k(value):
+    """Компактный формат под ширину мобильного экрана: 804K, 29.6K, 1.2M."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 100_000:
+        return f"{value / 1000:.0f}K"
     return f"{value / 1000:.1f}K"
 
 
@@ -108,13 +113,13 @@ def main():
 
     rows.sort(key=lambda r: -r[1])
 
-    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(calc_time))
-    lines = [f"Margin borrow/repay 24h — {ts}", ""]
-    lines.append(f"{'SYM':10} {'BOR':>9} {'REP':>9} {'B/R':>5} {'CHNG':>6}")
+    ts = time.strftime("%d.%m %H:%M UTC", time.gmtime(calc_time))
+    lines = [f"Margin 24h — {ts}", ""]
+    lines.append(f"{'SYM':7}{'BOR':>6}{'REP':>7} {'B/R':>4} {'CHNG':>5}")
     for asset, bor, rep, ratio, chng, is_new in rows:
-        mark = " 🆕" if is_new else ""
+        mark = "🆕" if is_new else ""
         lines.append(
-            f"{asset:10} {fmt_k(bor):>9} {fmt_k(rep):>9} {ratio:>5.1f} {chng:>6.2f}{mark}"
+            f"{asset:7}{fmt_k(bor):>6}{fmt_k(rep):>7} {ratio:>4.1f} {chng:>5.2f}{mark}"
         )
     text = "\n".join(lines)
     print(text)
