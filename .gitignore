@@ -3,3 +3,5 @@ cron.log
 __pycache__/
 *.db
 .env
+cron_exp.log
+state_exp.json
