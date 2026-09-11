@@ -12,9 +12,14 @@
   - ПУЛ ПУСТ: ошибка -3045 у maxBorrowable = занять больше нечего 🔥
 
 Сигналы-события (отдельными сообщениями ⚡, с кулдауном):
-  - LONG: пул пуст + funding < 0 + цена пошла вверх за WINDOW_MIN — старт сквиза
+  - SHORT по правилу 4ч (ПРОВЕРЕНО бэктестом авг 2026, 9060 постов):
+    серия в таблице >=4ч + рост >=8% за 4ч -> шорт, горизонт сутки
+    (8-12%: -10.6%/24ч, 89% падают; 12-20%: -14.1%, 90%)
+  - LONG: пул пуст + funding < 0 + цена вверх за WINDOW_MIN — старт сквиза
+    (экспериментальный, бэктест лонгов эффекта почти не нашёл)
   - SHORT: резкий прирост займов + цена вниз за WINDOW_MIN — старт дампа
-История цены/займов копится в state_exp.json при каждом запуске крона.
+    (экспериментальный; бэктест голых BOR/BR не подтвердил — смотрим в деле)
+История цены/займов и серии присутствия копятся в state_exp.json.
 
 Запуск: python3 signals_bot.py [--post]
 .env: BINANCE_API_KEY, BINANCE_API_SECRET, TG_BOT_TOKEN_EXP, TG_CHAT_ID_EXP
@@ -43,7 +48,15 @@ WINDOW_MIN = 30      # окно изменения цены/займов, мин
 PRICE_TRIG = 2.0     # % движения цены за окно для триггера
 BOR_TRIG_ABS = 20_000  # мин. прирост займов за окно, USDT
 COOLDOWN_MIN = 120   # повторный сигнал по токену/направлению не чаще
-HISTORY_KEEP = 20    # точек истории на токен (~100 минут при кроне 5м)
+HISTORY_KEEP = 64    # точек истории на токен (~5.3 часа при кроне 5м)
+
+# проверенное правило из бэктеста канала (авг 2026, 9060 постов):
+# серия в таблице >=4ч (разрывы до 30м) + рост >=8% за 4ч -> шорт на сутки
+# (8-12%: -10.6%/24ч, 89% падают; 12-20%: -14.1%, 90%)
+SERIES_MIN_H = 4.0     # минимальная длительность серии, часов
+SERIES_GAP_MIN = 30    # допустимый разрыв серии, минут
+PUMP_MIN = 8.0         # минимальный рост за 4ч, %
+RULE_COOLDOWN_H = 24   # повтор сигнала по монете не чаще, часов
 
 
 def load_env():
@@ -90,11 +103,32 @@ def fmt_k(value):
 
 def load_state():
     if not STATE_FILE.exists():
-        return {"ratios": {}, "history": {}, "alerts": {}}
-    state = json.loads(STATE_FILE.read_text())
+        state = {}
+    else:
+        state = json.loads(STATE_FILE.read_text())
     if "ratios" not in state:  # миграция со старого формата {asset: ratio}
-        state = {"ratios": state, "history": {}, "alerts": {}}
+        state = {"ratios": state}
+    for key in ("history", "alerts", "presence"):
+        state.setdefault(key, {})
     return state
+
+
+def update_presence(state, assets, now):
+    """Серии присутствия в таблице: {asset: [начало, последний_раз]}.
+
+    Серия рвётся, если токена не было дольше SERIES_GAP_MIN минут.
+    """
+    presence = state["presence"]
+    for asset in assets:
+        entry = presence.get(asset)
+        if entry is None or now - entry[1] > SERIES_GAP_MIN * 60:
+            presence[asset] = [now, now]
+        else:
+            entry[1] = now
+    # выкидываем окончательно оборвавшиеся серии отсутствующих токенов
+    for asset in list(presence):
+        if asset not in assets and now - presence[asset][1] > SERIES_GAP_MIN * 60:
+            del presence[asset]
 
 
 def margin_rows(prev_ratios):
@@ -269,6 +303,45 @@ def detect_signals(assets_data, state, now):
     return alerts
 
 
+def detect_rule_signals(assets, state, now):
+    """Проверенное правило бэктеста: серия >=4ч + памп >=8% за 4ч -> шорт.
+
+    Историческая статистика (авг 2026): 8-12% -> -10.6% за 24ч (89% падают),
+    12-20% -> -14.1% (90%), >20% -> -14.9% (83%). Кулдаун 24ч на монету.
+    """
+    alerts = []
+    for asset in assets:
+        entry = state["presence"].get(asset)
+        if not entry:
+            continue
+        series_h = (now - entry[0]) / 3600
+        if series_h < SERIES_MIN_H:
+            continue
+        delta = window_delta(state["history"].get(asset, []), now, 240)
+        if delta is None:
+            continue
+        pump, _ = delta
+        if pump < PUMP_MIN:
+            continue
+        key = f"{asset}:RULE"
+        if now - state["alerts"].get(key, 0) < RULE_COOLDOWN_H * 3600:
+            continue
+        state["alerts"][key] = now
+        if pump >= 20:
+            stat = "истор.: -14.9%/24ч, 83% падают"
+        elif pump >= 12:
+            stat = "истор.: -14.1%/24ч, 90% падают"
+        else:
+            stat = "истор.: -10.6%/24ч, 89% падают"
+        alerts.append(
+            f"⚡ SHORT по правилу 4ч: {asset}\n"
+            f"в таблице {series_h:.1f}ч подряд,\n"
+            f"рост +{pump:.1f}% за 4ч ({stat}).\n"
+            f"Горизонт до суток."
+        )
+    return alerts
+
+
 def send_telegram(text):
     token = ENV.get("TG_BOT_TOKEN_EXP")
     chat_id = ENV.get("TG_CHAT_ID_EXP")
@@ -349,8 +422,27 @@ def main():
     if loan_lines:
         lines += ["", f"{'LOAN':7}{'APR':>5}"] + loan_lines
 
-    # сигналы-события: срабатывают в момент сочетания параметров
-    alerts = detect_signals(assets_data, state, now)
+    # серии присутствия + сигналы-события
+    update_presence(state, assets, now)
+    alerts = detect_rule_signals(assets, state, now) + detect_signals(
+        assets_data, state, now
+    )
+
+    # блок серий: кандидаты на правило 4ч (серия >=2ч, чтобы видеть зреющие)
+    series_lines = []
+    for asset in assets:
+        entry = state["presence"].get(asset)
+        if not entry:
+            continue
+        series_h = (now - entry[0]) / 3600
+        if series_h < 2:
+            continue
+        delta = window_delta(state["history"].get(asset, []), now, 240)
+        pump_s = f"{delta[0]:+.0f}%" if delta else "-"
+        flag = " ❗" if series_h >= SERIES_MIN_H and delta and delta[0] >= PUMP_MIN else ""
+        series_lines.append(f"{asset:7}{series_h:>4.1f}ч {pump_s:>5}{flag}")
+    if series_lines:
+        lines += ["", f"{'СЕРИЯ':7}{'ЧАС':>5} {'Р4Ч':>5}"] + series_lines
 
     state["ratios"] = {r[0]: r[3] for r in rows}
     STATE_FILE.write_text(json.dumps(state))
