@@ -33,8 +33,7 @@ URL = "https://www.binance.com/bapi/margin/v1/public/margin/statistics/24h-borro
 STATE_FILE = Path(__file__).with_name("state.json")
 ENV_FILE = Path(__file__).with_name(".env")
 
-MIN_RATIO = 3.0        # фильтр канала: B/R >= 3
-MIN_BORROW_USDT = 10_000  # отсечка мелочи, чтобы не ловить B/R=inf на нулях
+MIN_RATIO = 3.0        # фильтр канала: B/R >= 3 (при REP > 0)
 EXCLUDE = {"USDT", "USDC", "FDUSD", "TUSD", "DAI"}  # стейблы не интересны
 
 
@@ -48,12 +47,14 @@ def fetch():
 
 
 def fmt_k(value):
-    """Компактный формат под ширину мобильного экрана: 804K, 29.6K, 1.2M."""
+    """Компактный формат под ширину мобильного экрана: 804K, 29.6K, 298, 1.2M."""
     if value >= 1_000_000:
         return f"{value / 1_000_000:.1f}M"
     if value >= 100_000:
         return f"{value / 1000:.0f}K"
-    return f"{value / 1000:.1f}K"
+    if value >= 1_000:
+        return f"{value / 1000:.1f}K"
+    return f"{value:.0f}"
 
 
 def load_env():
@@ -101,7 +102,7 @@ def main():
         asset = c["asset"]
         bor = float(c["totalBorrowInUsdt"])
         rep = float(c["totalRepayInUsdt"])
-        if asset in EXCLUDE or bor < MIN_BORROW_USDT or rep <= 0:
+        if asset in EXCLUDE or rep <= 0:
             continue
         ratio = bor / rep
         if ratio < MIN_RATIO:

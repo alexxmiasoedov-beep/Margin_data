@@ -24,7 +24,8 @@ GET https://www.binance.com/bapi/margin/v1/public/margin/statistics/24h-borrow-a
 
 - **BOR** = `totalBorrowInUsdt`
 - **REP** = `totalRepayInUsdt`
-- **B/R** = BOR / REP — в таблицу попадают только токены с **B/R ≥ 3**
+- **B/R** = BOR / REP — в таблицу попадают только токены с **B/R ≥ 3** (и REP > 0);
+  минимального порога по объёму нет — мелкие суммы тоже показываются
 - **CHNG** = изменение B/R относительно прошлого замера
 - **🆕** = токен впервые прошёл фильтр
 
