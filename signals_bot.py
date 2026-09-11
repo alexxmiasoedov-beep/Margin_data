@@ -303,11 +303,63 @@ def detect_signals(assets_data, state, now):
     return alerts
 
 
-def detect_rule_signals(assets, state, now):
+def grade_short(info, momentum):
+    """Оценка качества шорт-сигнала по данным, которых не было в бэктесте.
+
+    Бэктест: 10-17% сигналов убыточны, ход против позиции до +36% — почти
+    наверняка сквизы. Наши данные о пуле займов/funding/OI отличают
+    «шортам есть чем давить» от «шорты уже набиты и зажаты».
+    Возвращает (балл 0..5, список строк-факторов, риск_сквиза).
+    """
+    checks = []  # (ok, текст)
+    checks.append((
+        not info["empty"],
+        "пул не пуст — шорты могут добавлять" if not info["empty"]
+        else "пул пуст — шортам нечем давить",
+    ))
+    f = info["funding"]
+    funding_ok = f is None or f > -0.05
+    checks.append((
+        funding_ok,
+        f"funding {f:+.2f}% — шорты не перегреты" if funding_ok and f is not None
+        else (f"funding {f:+.2f}% — шорты переполнены" if f is not None
+              else "funding: нет данных"),
+    ))
+    oi = info.get("oi_chg")
+    oi_ok = oi is not None and oi > 3
+    if oi_ok:
+        oi_text = f"OI {oi:+.0f}%/4ч — позиции набирают"
+    elif oi is not None:
+        oi_text = f"OI {oi:+.0f}%/4ч — набора нет"
+    else:
+        oi_text = "OI: нет данных"
+    checks.append((oi_ok, oi_text))
+    mom_ok = momentum is not None and momentum <= 0
+    checks.append((
+        mom_ok,
+        f"памп остановился ({momentum:+.1f}%/30м)" if mom_ok
+        else (f"памп ещё идёт ({momentum:+.1f}%/30м) — вход рано"
+              if momentum is not None else "momentum: нет данных"),
+    ))
+    dbor = info.get("bor_chg_30m")
+    dbor_ok = dbor is not None and dbor > 0
+    checks.append((
+        dbor_ok,
+        f"займы +{fmt_k(dbor)}/30м — продолжают продавать" if dbor_ok
+        else "займы сейчас не растут",
+    ))
+    score = sum(ok for ok, _ in checks)
+    factors = [("✓ " if ok else "✗ ") + text for ok, text in checks]
+    squeeze = info["empty"] and f is not None and f <= -0.1
+    return score, factors, squeeze
+
+
+def detect_rule_signals(assets, assets_data, state, now):
     """Проверенное правило бэктеста: серия >=4ч + памп >=8% за 4ч -> шорт.
 
     Историческая статистика (авг 2026): 8-12% -> -10.6% за 24ч (89% падают),
     12-20% -> -14.1% (90%), >20% -> -14.9% (83%). Кулдаун 24ч на монету.
+    К сигналу прикладывается оценка качества по нашим live-данным.
     """
     alerts = []
     for asset in assets:
@@ -317,7 +369,8 @@ def detect_rule_signals(assets, state, now):
         series_h = (now - entry[0]) / 3600
         if series_h < SERIES_MIN_H:
             continue
-        delta = window_delta(state["history"].get(asset, []), now, 240)
+        points = state["history"].get(asset, [])
+        delta = window_delta(points, now, 240)
         if delta is None:
             continue
         pump, _ = delta
@@ -333,12 +386,23 @@ def detect_rule_signals(assets, state, now):
             stat = "истор.: -14.1%/24ч, 90% падают"
         else:
             stat = "истор.: -10.6%/24ч, 89% падают"
-        alerts.append(
+
+        info = assets_data.get(asset, {"empty": False, "funding": None})
+        short_delta = window_delta(points, now, WINDOW_MIN)
+        momentum = short_delta[0] if short_delta else None
+        info = dict(info, bor_chg_30m=short_delta[1] if short_delta else None)
+        score, factors, squeeze = grade_short(info, momentum)
+
+        msg = (
             f"⚡ SHORT по правилу 4ч: {asset}\n"
-            f"в таблице {series_h:.1f}ч подряд,\n"
-            f"рост +{pump:.1f}% за 4ч ({stat}).\n"
-            f"Горизонт до суток."
+            f"в таблице {series_h:.1f}ч, +{pump:.1f}% за 4ч\n"
+            f"{stat}. Горизонт до суток.\n"
+            f"Качество: {'★' * score}{'☆' * (5 - score)} ({score}/5)\n"
+            + "\n".join(factors)
         )
+        if squeeze:
+            msg += "\n⚠️ РИСК СКВИЗА: пул пуст + funding сильно отриц."
+        alerts.append(msg)
     return alerts
 
 
@@ -394,7 +458,11 @@ def main():
             points = state["history"].setdefault(asset, [])
             points.append([now, last_price, bor_map[asset]])
             del points[:-HISTORY_KEEP]
-        assets_data[asset] = {"empty": empty_map[asset], "funding": funding}
+        assets_data[asset] = {
+            "empty": empty_map[asset],
+            "funding": funding,
+            "oi_chg": sig["oi_chg"] if sig else None,
+        }
 
         if sig is None and chg24 is None:
             continue
@@ -424,7 +492,7 @@ def main():
 
     # серии присутствия + сигналы-события
     update_presence(state, assets, now)
-    alerts = detect_rule_signals(assets, state, now) + detect_signals(
+    alerts = detect_rule_signals(assets, assets_data, state, now) + detect_signals(
         assets_data, state, now
     )
 
