@@ -109,7 +109,9 @@ def fmt_price(value):
         return f"{value:,.1f}"
     if value >= 1:
         return f"{value:.3f}"
-    return f"{value:.4g}"
+    if value >= 0.001:
+        return f"{value:.5f}".rstrip("0")
+    return f"{value:.8f}".rstrip("0")
 
 
 def load_state():
