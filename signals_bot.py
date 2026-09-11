@@ -174,6 +174,24 @@ def pool_empty(asset):
         return False
 
 
+def price_changes():
+    """Изменение цены за 24ч по всем спот-парам: {symbol: %}."""
+    try:
+        tickers = fetch_json("https://api.binance.com/api/v3/ticker/24hr")
+        return {t["symbol"]: float(t["priceChangePercent"]) for t in tickers}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def verdict(empty, funding, chg):
+    """🔼 — сетап сквиза (лонг), 🔽 — дамп в процессе (шорт), '' — нет сигнала."""
+    if empty and funding is not None and funding <= -0.1 and (chg is None or chg > -3):
+        return "🔼"
+    if chg is not None and chg < -5:
+        return "🔽"
+    return ""
+
+
 def send_telegram(text):
     token = ENV.get("TG_BOT_TOKEN_EXP")
     chat_id = ENV.get("TG_CHAT_ID_EXP")
@@ -207,29 +225,42 @@ def main():
             f"{asset:7}{fmt_k(bor):>6}{fmt_k(rep):>7} {ratio:>4.1f} {chng:>5.2f}{mark}"
         )
 
-    # блок фьючерсов: выровненные колонки, без эмодзи внутри строк
+    prices = price_changes()
+    empty_map = {asset: pool_empty(asset) for asset in assets}
+
+    # блок фьючерсов: выровненные колонки + цена 24ч + вердикт
     fut_lines = []
     for asset in assets:
         sig = futures_signals(asset)
-        if sig is None:
+        chg = prices.get(f"{asset}USDT")
+        if chg is None:
+            chg = prices.get(f"1000{asset}USDT")
+        if sig is None and chg is None:
             continue
-        oi = f"{sig['oi_chg']:+.0f}%" if sig["oi_chg"] is not None else "-"
-        ls = f"{sig['ls']:.1f}" if sig["ls"] is not None else "-"
-        fut_lines.append(f"{asset:7}{sig['funding']:+6.2f}% {oi:>5} {ls:>4}")
+        funding = sig["funding"] if sig else None
+        fund_s = f"{funding:+6.2f}" if funding is not None else f"{'-':>6}"
+        oi = f"{sig['oi_chg']:+.0f}%" if sig and sig["oi_chg"] is not None else "-"
+        ls = f"{sig['ls']:.1f}" if sig and sig["ls"] is not None else "-"
+        chg_s = f"{chg:+.0f}%" if chg is not None else "-"
+        mark = verdict(empty_map[asset], funding, chg)
+        fut_lines.append(f"{asset:7}{fund_s} {oi:>4} {ls:>3} {chg_s:>4}{mark}")
     if fut_lines:
-        lines += ["", f"{'FUT':7}{'FUND':>7} {'OI4H':>5} {'LS':>4}"] + fut_lines
+        lines += ["", f"{'FUT':7}{'FUND':>6} {'OI4H':>4} {'LS':>3} {'P24':>4}"] + fut_lines
 
     # блок займов: ставка в годовых + состояние пула
     loan_lines = []
     for asset in assets:
         apr = rates.get(asset)
-        empty = pool_empty(asset)
+        empty = empty_map[asset]
         if (apr is None or apr < APR_ALERT) and not empty:
             continue
         apr_s = f"{apr:.0f}%" if apr is not None else "-"
         loan_lines.append(f"{asset:7}{apr_s:>5}  {'ПУЛ ПУСТ 🔥' if empty else ''}".rstrip())
     if loan_lines:
         lines += ["", f"{'LOAN':7}{'APR':>5}"] + loan_lines
+
+    if any("🔼" in l or "🔽" in l for l in fut_lines):
+        lines += ["", "🔼 сетап сквиза (лонг)", "🔽 дамп в процессе (шорт)"]
 
     text = "\n".join(lines)
     print(text)
