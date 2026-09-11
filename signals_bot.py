@@ -4,12 +4,17 @@
 Постит в отдельную группу (@Margin_data_exper_bot). Основной бот
 (margin_data.py) не трогаем — он шлёт чистую таблицу.
 
-Сигналы по каждому токену из таблицы (B/R >= 3):
+Сводка по каждому токену из таблицы (B/R >= 3):
   - funding rate фьючерсов (сильно отрицательный = переполнены шорты)
   - изменение открытого интереса за ~4ч (набор позиций)
   - long/short ratio топ-трейдеров
   - почасовая ставка займа в годовых (высокая = пул выгребли), signed API
-  - POOL EMPTY: ошибка -3045 у maxBorrowable = занять больше нечего 🔥
+  - ПУЛ ПУСТ: ошибка -3045 у maxBorrowable = занять больше нечего 🔥
+
+Сигналы-события (отдельными сообщениями ⚡, с кулдауном):
+  - LONG: пул пуст + funding < 0 + цена пошла вверх за WINDOW_MIN — старт сквиза
+  - SHORT: резкий прирост займов + цена вниз за WINDOW_MIN — старт дампа
+История цены/займов копится в state_exp.json при каждом запуске крона.
 
 Запуск: python3 signals_bot.py [--post]
 .env: BINANCE_API_KEY, BINANCE_API_SECRET, TG_BOT_TOKEN_EXP, TG_CHAT_ID_EXP
@@ -32,6 +37,13 @@ ENV_FILE = Path(__file__).with_name(".env")
 MIN_RATIO = 3.0
 EXCLUDE = {"USDT", "USDC", "FDUSD", "TUSD", "DAI"}
 APR_ALERT = 20.0  # показывать ставку займа, если выше этого % годовых
+
+# сигналы-события: сочетание параметров в момент времени, не висящее состояние
+WINDOW_MIN = 30      # окно изменения цены/займов, минут
+PRICE_TRIG = 2.0     # % движения цены за окно для триггера
+BOR_TRIG_ABS = 20_000  # мин. прирост займов за окно, USDT
+COOLDOWN_MIN = 120   # повторный сигнал по токену/направлению не чаще
+HISTORY_KEEP = 20    # точек истории на токен (~100 минут при кроне 5м)
 
 
 def load_env():
@@ -76,12 +88,20 @@ def fmt_k(value):
     return f"{value:.0f}"
 
 
-def margin_rows():
+def load_state():
+    if not STATE_FILE.exists():
+        return {"ratios": {}, "history": {}, "alerts": {}}
+    state = json.loads(STATE_FILE.read_text())
+    if "ratios" not in state:  # миграция со старого формата {asset: ratio}
+        state = {"ratios": state, "history": {}, "alerts": {}}
+    return state
+
+
+def margin_rows(prev_ratios):
     payload = fetch_json(MARGIN_URL)
     if payload.get("code") != "000000":
         raise RuntimeError(f"Binance error: {payload}")
     data = payload["data"]
-    prev = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     rows = []
     for c in data["coins"]:
         asset = c["asset"]
@@ -92,10 +112,9 @@ def margin_rows():
         ratio = bor / rep
         if ratio < MIN_RATIO:
             continue
-        chng = 0.0 if asset not in prev else ratio - prev[asset]
-        rows.append((asset, bor, rep, ratio, chng, asset not in prev))
+        chng = 0.0 if asset not in prev_ratios else ratio - prev_ratios[asset]
+        rows.append((asset, bor, rep, ratio, chng, asset not in prev_ratios))
     rows.sort(key=lambda r: -r[1])
-    STATE_FILE.write_text(json.dumps({r[0]: r[3] for r in rows}, indent=1))
     return rows, data["calculationTime"] / 1000
 
 
@@ -174,22 +193,80 @@ def pool_empty(asset):
         return False
 
 
-def price_changes():
-    """Изменение цены за 24ч по всем спот-парам: {symbol: %}."""
+def spot_tickers():
+    """{symbol: (изменение за 24ч %, последняя цена)} по всем спот-парам."""
     try:
         tickers = fetch_json("https://api.binance.com/api/v3/ticker/24hr")
-        return {t["symbol"]: float(t["priceChangePercent"]) for t in tickers}
+        return {
+            t["symbol"]: (float(t["priceChangePercent"]), float(t["lastPrice"]))
+            for t in tickers
+        }
     except Exception:  # noqa: BLE001
         return {}
 
 
-def verdict(empty, funding, chg):
-    """🔼 — сетап сквиза (лонг), 🔽 — дамп в процессе (шорт), '' — нет сигнала."""
-    if empty and funding is not None and funding <= -0.1 and (chg is None or chg > -3):
-        return "🔼"
-    if chg is not None and chg < -5:
-        return "🔽"
-    return ""
+def window_delta(points, now, minutes):
+    """(Δцены %, Δзаймов USDT) относительно точки ~minutes назад, иначе None."""
+    target = now - minutes * 60
+    past = [p for p in points if p[0] <= target + 150]  # допуск полшага крона
+    if not past:
+        return None
+    ts, price, bor = past[-1]
+    if now - ts < (minutes - 10) * 60:  # истории ещё мало
+        return None
+    _, cur_price, cur_bor = points[-1]
+    if price <= 0:
+        return None
+    return ((cur_price / price - 1) * 100, cur_bor - bor)
+
+
+def detect_signals(assets_data, state, now):
+    """Сигналы-события: возвращает список текстов алертов.
+
+    LONG ⚡ — пул пуст, funding отрицательный и цена пошла ВВЕРХ за окно:
+             зажатые шорты начинают гореть — старт сквиза.
+    SHORT ⚡ — за окно резко приросли займы и цена пошла ВНИЗ:
+             кто-то занимает и продаёт прямо сейчас — старт дампа.
+    Кулдаун COOLDOWN_MIN на (токен, направление).
+    """
+    alerts = []
+    for asset, info in assets_data.items():
+        points = state["history"].get(asset, [])
+        if len(points) < 2:
+            continue
+        delta = window_delta(points, now, WINDOW_MIN)
+        if delta is None:
+            continue
+        price_chg, bor_chg = delta
+
+        fired = []
+        if (
+            info["empty"]
+            and info["funding"] is not None
+            and info["funding"] <= -0.05
+            and price_chg >= PRICE_TRIG
+        ):
+            fired.append((
+                "LONG",
+                f"⚡ LONG сигнал: {asset}\n"
+                f"цена +{price_chg:.1f}% за {WINDOW_MIN}м, пул займов пуст,\n"
+                f"funding {info['funding']:+.2f}% — старт сквиза?",
+            ))
+        if bor_chg >= BOR_TRIG_ABS and price_chg <= -PRICE_TRIG:
+            fired.append((
+                "SHORT",
+                f"⚡ SHORT сигнал: {asset}\n"
+                f"займы +{fmt_k(bor_chg)} и цена {price_chg:.1f}% за {WINDOW_MIN}м\n"
+                f"— занимают и продают, старт дампа?",
+            ))
+
+        for direction, text in fired:
+            key = f"{asset}:{direction}"
+            last = state["alerts"].get(key, 0)
+            if now - last >= COOLDOWN_MIN * 60:
+                state["alerts"][key] = now
+                alerts.append(text)
+    return alerts
 
 
 def send_telegram(text):
@@ -212,7 +289,9 @@ def send_telegram(text):
 
 
 def main():
-    rows, calc_time = margin_rows()
+    now = time.time()
+    state = load_state()
+    rows, calc_time = margin_rows(state["ratios"])
     assets = [r[0] for r in rows]
     rates = borrow_rates(assets)
 
@@ -225,27 +304,38 @@ def main():
             f"{asset:7}{fmt_k(bor):>6}{fmt_k(rep):>7} {ratio:>4.1f} {chng:>5.2f}{mark}"
         )
 
-    prices = price_changes()
+    tickers = spot_tickers()
     empty_map = {asset: pool_empty(asset) for asset in assets}
 
-    # блок фьючерсов: выровненные колонки + цена 24ч + вердикт
+    # обновляем историю (цена + займы) и собираем данные для детектора
+    assets_data = {}
+    bor_map = {r[0]: r[1] for r in rows}
     fut_lines = []
     for asset in assets:
         sig = futures_signals(asset)
-        chg = prices.get(f"{asset}USDT")
-        if chg is None:
-            chg = prices.get(f"1000{asset}USDT")
-        if sig is None and chg is None:
-            continue
+        tick = tickers.get(f"{asset}USDT") or tickers.get(f"1000{asset}USDT")
+        chg24, last_price = tick if tick else (None, None)
         funding = sig["funding"] if sig else None
+
+        if last_price is not None:
+            points = state["history"].setdefault(asset, [])
+            points.append([now, last_price, bor_map[asset]])
+            del points[:-HISTORY_KEEP]
+        assets_data[asset] = {"empty": empty_map[asset], "funding": funding}
+
+        if sig is None and chg24 is None:
+            continue
         fund_s = f"{funding:+6.2f}" if funding is not None else f"{'-':>6}"
         oi = f"{sig['oi_chg']:+.0f}%" if sig and sig["oi_chg"] is not None else "-"
         ls = f"{sig['ls']:.1f}" if sig and sig["ls"] is not None else "-"
-        chg_s = f"{chg:+.0f}%" if chg is not None else "-"
-        mark = verdict(empty_map[asset], funding, chg)
-        fut_lines.append(f"{asset:7}{fund_s} {oi:>4} {ls:>3} {chg_s:>4}{mark}")
+        chg_s = f"{chg24:+.0f}%" if chg24 is not None else "-"
+        fut_lines.append(f"{asset:7}{fund_s} {oi:>4} {ls:>3} {chg_s:>4}")
     if fut_lines:
         lines += ["", f"{'FUT':7}{'FUND':>6} {'OI4H':>4} {'LS':>3} {'P24':>4}"] + fut_lines
+
+    # чистим историю токенов, выпавших из фильтра
+    for stale in set(state["history"]) - set(assets):
+        del state["history"][stale]
 
     # блок займов: ставка в годовых + состояние пула
     loan_lines = []
@@ -259,14 +349,21 @@ def main():
     if loan_lines:
         lines += ["", f"{'LOAN':7}{'APR':>5}"] + loan_lines
 
-    if any("🔼" in l or "🔽" in l for l in fut_lines):
-        lines += ["", "🔼 сетап сквиза (лонг)", "🔽 дамп в процессе (шорт)"]
+    # сигналы-события: срабатывают в момент сочетания параметров
+    alerts = detect_signals(assets_data, state, now)
+
+    state["ratios"] = {r[0]: r[3] for r in rows}
+    STATE_FILE.write_text(json.dumps(state))
 
     text = "\n".join(lines)
     print(text)
+    for alert in alerts:
+        print("\n" + alert)
 
     if "--post" in sys.argv:
         send_telegram(text)
+        for alert in alerts:
+            send_telegram(alert)
 
 
 if __name__ == "__main__":
