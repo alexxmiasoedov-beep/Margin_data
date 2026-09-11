@@ -207,28 +207,29 @@ def main():
             f"{asset:7}{fmt_k(bor):>6}{fmt_k(rep):>7} {ratio:>4.1f} {chng:>5.2f}{mark}"
         )
 
-    lines += ["", "Signals:"]
+    # блок фьючерсов: выровненные колонки, без эмодзи внутри строк
+    fut_lines = []
     for asset in assets:
         sig = futures_signals(asset)
-        extras = []
-        if sig:
-            extras.append(f"f{sig['funding']:+.2f}")
-            if sig["oi_chg"] is not None:
-                extras.append(f"OI{sig['oi_chg']:+.0f}%")
-            if sig["ls"] is not None:
-                extras.append(f"LS{sig['ls']:.1f}")
+        if sig is None:
+            continue
+        oi = f"{sig['oi_chg']:+.0f}%" if sig["oi_chg"] is not None else "-"
+        ls = f"{sig['ls']:.1f}" if sig["ls"] is not None else "-"
+        fut_lines.append(f"{asset:7}{sig['funding']:+6.2f}% {oi:>5} {ls:>4}")
+    if fut_lines:
+        lines += ["", f"{'FUT':7}{'FUND':>7} {'OI4H':>5} {'LS':>4}"] + fut_lines
+
+    # блок займов: ставка в годовых + состояние пула
+    loan_lines = []
+    for asset in assets:
         apr = rates.get(asset)
-        alert = []
-        if apr is not None and apr >= APR_ALERT:
-            alert.append(f"APR{apr:.0f}%")
-        if pool_empty(asset):
-            alert.append("POOL EMPTY🔥")
-        if extras:
-            lines.append(f"{asset:7}" + " ".join(extras))
-            if alert:
-                lines.append(f"{'':7}" + " ".join(alert) + " ⚠️")
-        elif alert:
-            lines.append(f"{asset:7}" + " ".join(alert) + " ⚠️")
+        empty = pool_empty(asset)
+        if (apr is None or apr < APR_ALERT) and not empty:
+            continue
+        apr_s = f"{apr:.0f}%" if apr is not None else "-"
+        loan_lines.append(f"{asset:7}{apr_s:>5}  {'ПУЛ ПУСТ 🔥' if empty else ''}".rstrip())
+    if loan_lines:
+        lines += ["", f"{'LOAN':7}{'APR':>5}"] + loan_lines
 
     text = "\n".join(lines)
     print(text)
