@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Экспериментальный бот: маржинальная таблица + сигналы аномалий.
 
-Постит в отдельную группу (@Margin_data_exper_bot). Основной бот
-(margin_data.py) не трогаем — он шлёт чистую таблицу.
+Сводка постится в информационную группу (@Margin_data_exper_bot), сигналы ⚡ —
+отдельным ботом в сигнальную группу (@Margin_signal_bot), чтобы не тонули
+в потоке таблиц; при недоступности сигнальной группы — fallback в общую.
+Основной бот (margin_data.py) не трогаем — он шлёт чистую таблицу.
 
 Сводка по каждому токену из таблицы (B/R >= 3):
   - funding rate фьючерсов (сильно отрицательный = переполнены шорты)
@@ -406,11 +408,12 @@ def detect_rule_signals(assets, assets_data, state, now):
     return alerts
 
 
-def send_telegram(text):
-    token = ENV.get("TG_BOT_TOKEN_EXP")
-    chat_id = ENV.get("TG_CHAT_ID_EXP")
+def send_telegram(text, target="EXP"):
+    """target: EXP — сводка в информационную группу, SIG — сигналы ⚡ в сигнальную."""
+    token = ENV.get(f"TG_BOT_TOKEN_{target}")
+    chat_id = ENV.get(f"TG_CHAT_ID_{target}")
     if not token or not chat_id:
-        raise RuntimeError("TG_BOT_TOKEN_EXP/TG_CHAT_ID_EXP not set in .env")
+        raise RuntimeError(f"TG_BOT_TOKEN_{target}/TG_CHAT_ID_{target} not set in .env")
     payload = urllib.parse.urlencode({
         "chat_id": chat_id,
         "text": f"```\n{text}\n```",
@@ -523,7 +526,11 @@ def main():
     if "--post" in sys.argv:
         send_telegram(text)
         for alert in alerts:
-            send_telegram(alert)
+            try:
+                send_telegram(alert, target="SIG")
+            except Exception as exc:  # noqa: BLE001 — сигнал не должен пропасть
+                print(f"signal group error: {exc}", file=sys.stderr)
+                send_telegram(alert)
 
 
 if __name__ == "__main__":
