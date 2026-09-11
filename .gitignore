@@ -1,4 +1,5 @@
 state.json
+cron.log
 __pycache__/
 *.db
 .env

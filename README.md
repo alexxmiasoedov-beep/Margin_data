@@ -41,9 +41,25 @@ python3 margin_data.py
 ```
 
 Без зависимостей (только стандартная библиотека). Состояние для расчёта CHNG/🆕
-хранится в `state.json`. Для периодического мониторинга — запуск по cron,
-например каждые 5 минут:
+хранится в `state.json`.
+
+## Отправка в Telegram
+
+Создайте `.env` рядом со скриптом (не коммитится):
 
 ```
-*/5 * * * * cd ~/projects/Binance-margin-data && python3 margin_data.py
+TG_BOT_TOKEN=<токен бота от @BotFather>
+TG_CHAT_ID=<id чата/группы/канала>
+```
+
+Запуск с постингом:
+
+```bash
+python3 margin_data.py --post
+```
+
+Периодический мониторинг по cron, каждые 5 минут:
+
+```
+*/5 * * * * cd ~/projects/Binance-margin-data && /usr/bin/python3 margin_data.py --post >> cron.log 2>&1
 ```

@@ -17,16 +17,21 @@
     🆕   = токен, которого не было в прошлом замере
 
 Состояние между запусками хранится в state.json рядом со скриптом.
+
+Запуск с флагом --post отправляет таблицу в Telegram: токен и чат берутся
+из .env рядом со скриптом (TG_BOT_TOKEN, TG_CHAT_ID).
 """
 
 import json
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 URL = "https://www.binance.com/bapi/margin/v1/public/margin/statistics/24h-borrow-and-repay"
 STATE_FILE = Path(__file__).with_name("state.json")
+ENV_FILE = Path(__file__).with_name(".env")
 
 MIN_RATIO = 3.0        # фильтр канала: B/R >= 3
 MIN_BORROW_USDT = 10_000  # отсечка мелочи, чтобы не ловить B/R=inf на нулях
@@ -44,6 +49,37 @@ def fetch():
 
 def fmt_k(value):
     return f"{value / 1000:.1f}K"
+
+
+def load_env():
+    env = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                env[key.strip()] = value.strip()
+    return env
+
+
+def send_telegram(text):
+    env = load_env()
+    token = env.get("TG_BOT_TOKEN")
+    chat_id = env.get("TG_CHAT_ID")
+    if not token or not chat_id:
+        raise RuntimeError("TG_BOT_TOKEN/TG_CHAT_ID not set in .env")
+    payload = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": f"```\n{text}\n```",
+        "parse_mode": "MarkdownV2",
+    }).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", data=payload
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        result = json.load(resp)
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram error: {result}")
 
 
 def main():
@@ -73,11 +109,21 @@ def main():
     rows.sort(key=lambda r: -r[1])
 
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(calc_time))
-    print(f"Margin borrow/repay 24h — {ts}\n")
-    print(f"{'SYM':10} {'BOR':>9} {'REP':>9} {'B/R':>5} {'CHNG':>6}")
+    lines = [f"Margin borrow/repay 24h — {ts}", ""]
+    lines.append(f"{'SYM':10} {'BOR':>9} {'REP':>9} {'B/R':>5} {'CHNG':>6}")
     for asset, bor, rep, ratio, chng, is_new in rows:
         mark = " 🆕" if is_new else ""
-        print(f"{asset:10} {fmt_k(bor):>9} {fmt_k(rep):>9} {ratio:>5.1f} {chng:>6.2f}{mark}")
+        lines.append(
+            f"{asset:10} {fmt_k(bor):>9} {fmt_k(rep):>9} {ratio:>5.1f} {chng:>6.2f}{mark}"
+        )
+    text = "\n".join(lines)
+    print(text)
+
+    if "--post" in sys.argv:
+        if rows:
+            send_telegram(text)
+        else:
+            print("(empty table — not posting)")
 
     # сохраняем текущие ratio всех прошедших фильтр токенов для расчёта CHNG
     STATE_FILE.write_text(json.dumps({a: r for a, _, _, r, _, _ in rows}, indent=1))
