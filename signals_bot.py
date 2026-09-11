@@ -103,6 +103,15 @@ def fmt_k(value):
     return f"{value:.0f}"
 
 
+def fmt_price(value):
+    """Цена с разумным числом знаков: 43210.5, 1.234, 0.02345, 0.00001234."""
+    if value >= 100:
+        return f"{value:,.1f}"
+    if value >= 1:
+        return f"{value:.3f}"
+    return f"{value:.4g}"
+
+
 def load_state():
     if not STATE_FILE.exists():
         state = {}
@@ -274,6 +283,7 @@ def detect_signals(assets_data, state, now):
         if delta is None:
             continue
         price_chg, bor_chg = delta
+        cur_price = points[-1][1]
 
         fired = []
         if (
@@ -284,16 +294,18 @@ def detect_signals(assets_data, state, now):
         ):
             fired.append((
                 "LONG",
-                f"⚡ LONG сигнал: {asset}\n"
-                f"цена +{price_chg:.1f}% за {WINDOW_MIN}м, пул займов пуст,\n"
-                f"funding {info['funding']:+.2f}% — старт сквиза?",
+                f"⚡ LONG (эксперим.): {asset}\n"
+                f"цена {fmt_price(cur_price)} (+{price_chg:.1f}% за {WINDOW_MIN}м)\n"
+                f"пул займов пуст, funding {info['funding']:+.2f}%\n"
+                f"— шорты зажаты, старт сквиза",
             ))
         if bor_chg >= BOR_TRIG_ABS and price_chg <= -PRICE_TRIG:
             fired.append((
                 "SHORT",
-                f"⚡ SHORT сигнал: {asset}\n"
-                f"займы +{fmt_k(bor_chg)} и цена {price_chg:.1f}% за {WINDOW_MIN}м\n"
-                f"— занимают и продают, старт дампа?",
+                f"⚡ SHORT (эксперим.): {asset}\n"
+                f"цена {fmt_price(cur_price)} ({price_chg:.1f}% за {WINDOW_MIN}м)\n"
+                f"займы +{fmt_k(bor_chg)} за {WINDOW_MIN}м\n"
+                f"— занимают и продают, старт дампа",
             ))
 
         for direction, text in fired:
@@ -397,6 +409,7 @@ def detect_rule_signals(assets, assets_data, state, now):
 
         msg = (
             f"⚡ SHORT по правилу 4ч: {asset}\n"
+            f"цена {fmt_price(points[-1][1])}\n"
             f"в таблице {series_h:.1f}ч, +{pump:.1f}% за 4ч\n"
             f"{stat}. Горизонт до суток.\n"
             f"Качество: {'★' * score}{'☆' * (5 - score)} ({score}/5)\n"
