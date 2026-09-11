@@ -37,63 +37,13 @@ MIN_RATIO = 3.0        # фильтр канала: B/R >= 3 (при REP > 0)
 EXCLUDE = {"USDT", "USDC", "FDUSD", "TUSD", "DAI"}  # стейблы не интересны
 
 
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.load(resp)
-
-
 def fetch():
-    payload = fetch_json(URL)
+    req = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.load(resp)
     if payload.get("code") != "000000":
         raise RuntimeError(f"Binance error: {payload}")
     return payload["data"]
-
-
-def futures_signals(asset):
-    """Сигналы с фьючерсов по токену: funding, динамика OI за ~4ч, L/S топов.
-
-    Возвращает None, если у токена нет USDT-M фьючерса.
-    """
-    symbol = None
-    funding = None
-    # мемкоины на фьючерсах торгуются с префиксом 1000 (1000SHIBUSDT и т.п.)
-    for candidate in (f"{asset}USDT", f"1000{asset}USDT"):
-        try:
-            prem = fetch_json(
-                f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={candidate}"
-            )
-            funding = float(prem["lastFundingRate"]) * 100  # в %
-            symbol = candidate
-            break
-        except Exception:  # noqa: BLE001 — нет фьючерса или временная ошибка
-            continue
-    if symbol is None:
-        return None
-    oi_chg = None
-    try:
-        hist = fetch_json(
-            "https://fapi.binance.com/futures/data/openInterestHist"
-            f"?symbol={symbol}&period=1h&limit=5"
-        )
-        if len(hist) >= 2:
-            first = float(hist[0]["sumOpenInterestValue"])
-            last = float(hist[-1]["sumOpenInterestValue"])
-            if first > 0:
-                oi_chg = (last / first - 1) * 100
-    except Exception:  # noqa: BLE001
-        pass
-    ls_ratio = None
-    try:
-        ls = fetch_json(
-            "https://fapi.binance.com/futures/data/topLongShortPositionRatio"
-            f"?symbol={symbol}&period=1h&limit=1"
-        )
-        if ls:
-            ls_ratio = float(ls[0]["longShortRatio"])
-    except Exception:  # noqa: BLE001
-        pass
-    return {"funding": funding, "oi_chg": oi_chg, "ls": ls_ratio}
 
 
 def fmt_k(value):
@@ -172,21 +122,6 @@ def main():
         lines.append(
             f"{asset:7}{fmt_k(bor):>6}{fmt_k(rep):>7} {ratio:>4.1f} {chng:>5.2f}{mark}"
         )
-    # блок фьючерсных сигналов по токенам из таблицы
-    sig_lines = []
-    for asset, _, _, _, _, _ in rows:
-        sig = futures_signals(asset)
-        if sig is None:
-            continue
-        parts = [f"{asset:7}f{sig['funding']:+.2f}%"]
-        if sig["oi_chg"] is not None:
-            parts.append(f"OI{sig['oi_chg']:+.0f}%")
-        if sig["ls"] is not None:
-            parts.append(f"LS{sig['ls']:.1f}")
-        sig_lines.append(" ".join(parts))
-    if sig_lines:
-        lines += ["", "Futures (fund/OI 4h/topLS):"] + sig_lines
-
     text = "\n".join(lines)
     print(text)
 
